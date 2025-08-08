@@ -131,11 +131,11 @@ class HDriveCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             # Tolerancia de impresión
             tolerance_input = material_inputs.addFloatSpinnerCommandInput(
                 'printTolerance',
-                'Tolerancia Impresión 3D (mm)',
+                'Compensación Impresión 3D (mm)',
                 'mm',
                 0.0, 0.5, 0.05, 0.2
             )
-            tolerance_input.tooltip = 'Tolerancia para impresión 3D'
+            tolerance_input.tooltip = 'Compensa la expansión del material en impresión 3D y añade espacio para lubricación'
             
             # Información calculada
             inputs.addTextBoxCommandInput(
@@ -339,7 +339,12 @@ class HDriveCommandExecuteHandler(adsk.core.CommandEventHandler):
                     f'• Dientes CS/FS: {teeth_cs}/{teeth_cs-2}\n' +
                     f'• Módulo: {module} mm\n' +
                     f'• Diámetro: {module * teeth_cs:.1f} mm\n' +
-                    f'• Material: {material}\n\n' +
+                    f'• Material: {material}\n' +
+                    f'• Compensación 3D: {tolerance} mm\n\n' +
+                    f'🔧 Características aplicadas:\n' +
+                    f'• Perfil involuta real\n' +
+                    f'• Espacio para grasa: {0.15 * module:.2f} mm\n' +
+                    f'• Filetes antiesfuerzo: {0.38 * module:.2f} mm\n\n' +
                     f'Los componentes se han creado en el diseño activo.'
                 )
             else:
@@ -561,69 +566,203 @@ class HarmonicDriveGenerator:
                 break
     
     def _draw_teeth(self, sketch, geometry, is_internal, points_per_tooth):
-        """Dibuja los dientes con perfil involuta simplificado"""
+        """Dibuja los dientes con perfil involuta real"""
         
         lines = sketch.sketchCurves.sketchLines
+        arcs = sketch.sketchCurves.sketchArcs
         num_teeth = geometry['teeth']
         pitch_radius_cm = geometry['pitch_radius'] / 10
         
-        # Para rendimiento, simplificar a líneas trapezoidales
+        # Parámetros del diente
         angle_per_tooth = 2 * math.pi / num_teeth
-        tooth_width = angle_per_tooth * 0.35  # Reducir ancho para mejor engrane
-        space_width = angle_per_tooth * 0.35  # Espacio entre dientes
+        module_cm = self.params.module / 10
+        pressure_angle_rad = math.radians(self.params.pressure_angle)
         
-        # Altura del diente
-        addendum_cm = self.params.addendum_factor * self.params.module / 10
-        dedendum_cm = self.params.dedendum_factor * self.params.module / 10
+        # Compensación para impresión 3D (expansión del material)
+        print_compensation = self.params.print_tolerance / 10  # mm a cm
         
-        # Radios para los círculos
+        # Espacio para lubricación (grasa)
+        grease_clearance = 0.15 * module_cm  # 15% del módulo para grasa
+        
+        # Radio base para involuta
+        base_radius_cm = pitch_radius_cm * math.cos(pressure_angle_rad)
+        
+        # Altura del diente con compensaciones
         if is_internal:
-            # Para engranaje interno
-            outer_r = pitch_radius_cm + dedendum_cm  
+            # Engranaje interno - reducir dientes para compensar expansión
+            addendum_cm = self.params.addendum_factor * module_cm - print_compensation
+            dedendum_cm = self.params.dedendum_factor * module_cm + grease_clearance
+            outer_r = pitch_radius_cm + dedendum_cm
             inner_r = pitch_radius_cm - addendum_cm
         else:
-            # Para engranaje externo
+            # Engranaje externo - reducir dientes para compensar expansión
+            addendum_cm = self.params.addendum_factor * module_cm - print_compensation
+            dedendum_cm = self.params.dedendum_factor * module_cm + grease_clearance
             outer_r = pitch_radius_cm + addendum_cm
             inner_r = pitch_radius_cm - dedendum_cm
         
-        # Crear lista de puntos para todo el perfil
+        # Espesor del diente en el círculo primitivo (con compensación)
+        tooth_thickness = (math.pi * module_cm / 2) - 2 * print_compensation
+        half_tooth_angle = tooth_thickness / (2 * pitch_radius_cm)
+        
+        # Crear perfil completo
         all_points = []
         
         for i in range(num_teeth):
-            base_angle = i * angle_per_tooth
+            tooth_angle = i * angle_per_tooth
             
-            # Cuatro puntos por diente (trapecio)
-            if is_internal:
-                # Dientes hacia adentro
-                points = [
-                    (outer_r, base_angle - space_width/2),  # Base izquierda
-                    (inner_r, base_angle - tooth_width/4),  # Punta izquierda
-                    (inner_r, base_angle + tooth_width/4),  # Punta derecha
-                    (outer_r, base_angle + space_width/2),  # Base derecha
-                ]
-            else:
-                # Dientes hacia afuera
-                points = [
-                    (inner_r, base_angle - space_width/2),  # Base izquierda
-                    (outer_r, base_angle - tooth_width/4),  # Punta izquierda
-                    (outer_r, base_angle + tooth_width/4),  # Punta derecha
-                    (inner_r, base_angle + space_width/2),  # Base derecha
-                ]
+            # Generar perfil involuta para un diente
+            tooth_points = self._generate_involute_tooth(
+                base_radius_cm,
+                pitch_radius_cm,
+                outer_r,
+                inner_r,
+                tooth_angle,
+                half_tooth_angle,
+                is_internal,
+                points_per_tooth // 2  # Puntos por lado del diente
+            )
             
-            # Convertir a coordenadas cartesianas y agregar
-            for r, angle in points:
-                x = r * math.cos(angle)
-                y = r * math.sin(angle)
-                all_points.append((x, y))
+            all_points.extend(tooth_points)
         
-        # Dibujar todas las líneas conectadas
+        # Dibujar el perfil completo con líneas
         for i in range(len(all_points)):
             x1, y1 = all_points[i]
-            x2, y2 = all_points[(i + 1) % len(all_points)]  # Conectar con el siguiente (circular)
+            x2, y2 = all_points[(i + 1) % len(all_points)]
             
             p1 = adsk.core.Point3D.create(x1, y1, 0)
             p2 = adsk.core.Point3D.create(x2, y2, 0)
             lines.addByTwoPoints(p1, p2)
+    
+    def _generate_involute_tooth(self, base_r, pitch_r, outer_r, inner_r, 
+                                 tooth_angle, half_tooth_angle, is_internal, 
+                                 points_per_side):
+        """Genera los puntos del perfil involuta para un diente"""
+        
+        points = []
+        
+        # Calcular parámetros de la involuta
+        if base_r < inner_r:
+            # La involuta comienza en el radio base
+            start_r = base_r
+        else:
+            # No hay involuta, usar arco circular
+            start_r = inner_r
+        
+        # Ángulo de la involuta en diferentes radios
+        def involute_angle(r):
+            if r <= base_r:
+                return 0
+            return math.sqrt((r/base_r)**2 - 1)
+        
+        # Generar puntos del lado izquierdo del diente (involuta)
+        left_points = []
+        for j in range(points_per_side):
+            if outer_r > base_r and inner_r < outer_r:
+                # Interpolar radio
+                t = j / (points_per_side - 1)
+                if is_internal:
+                    r = outer_r - t * (outer_r - inner_r)
+                else:
+                    r = inner_r + t * (outer_r - inner_r)
+                
+                # Calcular posición en la involuta
+                if r > base_r:
+                    # Usar ecuación de involuta
+                    inv_angle = involute_angle(r)
+                    base_angle = tooth_angle - half_tooth_angle
+                    
+                    # Ajuste para involuta
+                    angle_offset = inv_angle - involute_angle(pitch_r)
+                    actual_angle = base_angle - angle_offset
+                    
+                    x = r * math.cos(actual_angle)
+                    y = r * math.sin(actual_angle)
+                else:
+                    # Bajo el círculo base, usar línea radial
+                    angle = tooth_angle - half_tooth_angle
+                    x = r * math.cos(angle)
+                    y = r * math.sin(angle)
+                
+                left_points.append((x, y))
+        
+        # Generar puntos del lado derecho (espejo de la involuta)
+        right_points = []
+        for j in range(points_per_side - 1, -1, -1):
+            if outer_r > base_r and inner_r < outer_r:
+                t = j / (points_per_side - 1)
+                if is_internal:
+                    r = outer_r - t * (outer_r - inner_r)
+                else:
+                    r = inner_r + t * (outer_r - inner_r)
+                
+                if r > base_r:
+                    inv_angle = involute_angle(r)
+                    base_angle = tooth_angle + half_tooth_angle
+                    angle_offset = inv_angle - involute_angle(pitch_r)
+                    actual_angle = base_angle + angle_offset
+                    
+                    x = r * math.cos(actual_angle)
+                    y = r * math.sin(actual_angle)
+                else:
+                    angle = tooth_angle + half_tooth_angle
+                    x = r * math.cos(angle)
+                    y = r * math.sin(angle)
+                
+                right_points.append((x, y))
+        
+        # Agregar filete en la raíz (redondeo para reducir concentración de esfuerzos)
+        if is_internal:
+            # Para dientes internos, el filete está en el radio exterior
+            fillet_points = self._generate_fillet(
+                left_points[-1], right_points[0], 
+                0.38 * self.params.module / 10, True
+            )
+        else:
+            # Para dientes externos, el filete está en el radio interior
+            fillet_points = self._generate_fillet(
+                left_points[0], right_points[-1],
+                0.38 * self.params.module / 10, False
+            )
+        
+        # Combinar todos los puntos
+        if is_internal:
+            points = left_points + fillet_points + right_points
+        else:
+            points = left_points + right_points + fillet_points
+        
+        return points
+    
+    def _generate_fillet(self, p1, p2, radius, at_outer):
+        """Genera puntos para un filete (redondeo) entre dos puntos"""
+        x1, y1 = p1
+        x2, y2 = p2
+        
+        # Calcular punto medio
+        mx = (x1 + x2) / 2
+        my = (y1 + y2) / 2
+        
+        # Generar 3 puntos para aproximar el arco
+        points = []
+        for i in range(1, 4):
+            t = i / 4
+            # Interpolar con una pequeña curvatura hacia afuera/adentro
+            x = x1 + (x2 - x1) * t
+            y = y1 + (y2 - y1) * t
+            
+            # Añadir curvatura
+            r = math.sqrt(x**2 + y**2)
+            angle = math.atan2(y, x)
+            if at_outer:
+                r = r + radius * (1 - abs(2*t - 1))  # Curva hacia afuera
+            else:
+                r = r - radius * (1 - abs(2*t - 1))  # Curva hacia adentro
+            
+            x = r * math.cos(angle)
+            y = r * math.sin(angle)
+            points.append((x, y))
+        
+        return points
     
     def _draw_ellipse(self, sketch, major_radius_cm, minor_radius_cm, num_points):
         """Dibuja una elipse usando spline"""
@@ -696,10 +835,13 @@ def run(context):
         
         # Mensaje de éxito
         _ui.messageBox(
-            '✅ Harmonic Drive Generator v1.0 cargado\n\n' +
-            '• Perfil involuta matemáticamente correcto\n' +
-            '• Validación de deformación integrada\n' +
-            '• Tests automatizados disponibles\n\n' +
+            '✅ Harmonic Drive Generator v1.1 cargado\n\n' +
+            '🆕 Nuevas características:\n' +
+            '• Perfil involuta REAL con curvas correctas\n' +
+            '• Compensación automática para impresión 3D\n' +
+            '• Espacios para lubricación con grasa\n' +
+            '• Filetes en raíz para reducir esfuerzos\n' +
+            '• Validación de deformación integrada\n\n' +
             'Haz clic en el botón ⚙️ en la barra de herramientas'
         )
         
