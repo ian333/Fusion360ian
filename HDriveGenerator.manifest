@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "1d3b9c8d-2e4f-5a6b-7c8d-9e0f1a2b3c4d",
+    "author": "AI-Assisted Development",
+    "description": {
+        "": "Parametric Harmonic Drive Generator - Create strain wave gears for robotics and precision applications"
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
